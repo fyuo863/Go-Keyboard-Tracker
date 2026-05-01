@@ -2,95 +2,94 @@ package display
 
 import (
 	"fmt"
-	"os"
+	"sort"
 	"strings"
 
-	"golang.org/x/term"
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
 
-// ═══════════════════════════════════════════════════════════
-// ANSI 终端控制码 —— 相当于给终端发送的"指令"，用来清屏、移动光标、变色等
-// ═══════════════════════════════════════════════════════════
+// BuildDashboard 创建整个 tview 界面树
+// 返回根节点（用于 app.SetRoot）和 statsTable（供外部刷新数据）
+func BuildDashboard() (tview.Primitive, *tview.Table) {
+	// ═══ 主表格：按键排行榜 ═══
+	statsTable := tview.NewTable()
+	statsTable.SetBorder(true)
+	statsTable.SetTitle(" Key Counter Pro (btop-style) ")
+	statsTable.SetBorderColor(rgb(230, 50, 100)) // 粉红边框
+	statsTable.SetTitleColor(rgb(230, 50, 100))  // 粉红标题
+	statsTable.SetSelectable(false, false)       // 只能按行选中
 
-const (
-	Escape       = "\033"            // ESC 字符，所有控制码的开头
-	AltScreenOn  = Escape + "[?1049h" // 切换到"备用屏幕"（退出后原终端内容还在）
-	AltScreenOff = Escape + "[?1049l" // 切回原屏幕
-	HideCursor   = Escape + "[?25l"   // 隐藏闪烁的光标
-	ShowCursor   = Escape + "[?25h"   // 重新显示光标
-	ClearScreen  = Escape + "[2J"     // 清空整个屏幕
-	CursorHome   = Escape + "[H"      // 把光标移到左上角 (1,1)
-	ColorReset   = Escape + "[0m"     // 重置所有颜色/样式
-)
+	// ═══ 底部状态栏 ═══
+	footer := tview.NewTextView()
+	footer.SetText("Press 'q' or Ctrl+C to quit | Monitoring Global Input...")
+	footer.SetTextColor(rgb(150, 150, 150)) // 灰色
 
-// Visualizer 是界面的"导演"——它不亲自画任何东西，而是创建组件并把它们摆到终端上
-// 真正的绘制逻辑都在 component.go 里的各个组件中
-type Visualizer struct {
-	width  int    // 终端当前宽度（列数）
-	height int    // 终端当前高度（行数）
-	pink   string // 预设的粉红色 —— 用于边框标题
-	green  string // 预设的绿色 —— 暂未使用，留着扩展
-	cyan   string // 预设的青色 —— 用于进度条
+	// ═══ 布局：表格填满上方，底部留一行 ═══
+	flex := tview.NewFlex().SetDirection(tview.FlexRow)
+	flex.AddItem(statsTable, 0, 1, true) // 比例 1，占据剩余空间
+	flex.AddItem(footer, 1, 0, false)    // 固定 1 行高
 
-	// 三个界面组件，每帧 Render 时重新创建（布局可随终端尺寸动态变化）
-	box       *BoxComponent       // 外围边框
-	statsList *StatsListComponent // 按键排行榜
-	footer    *TextComponent      // 底部提示文字
+	return flex, statsTable
 }
 
-// NewVisualizer 创建一个可视化器，顺便定义好三种常用颜色
-func NewVisualizer() *Visualizer {
-	return &Visualizer{
-		pink:  fgRGB(230, 50, 100), // 粉红
-		green: fgRGB(50, 200, 100), // 绿色
-		cyan:  fgRGB(0, 255, 255),  // 青色
+// RefreshTable 用最新统计数据刷新表格内容
+// stats 的 key 是虚拟键码，value 是按下次数
+func RefreshTable(table *tview.Table, stats map[uint16]int) {
+	// --- 排序：按次数从高到低 ---
+	type kv struct {
+		Key   uint16
+		Count int
+	}
+	var sorted []kv
+	for k, v := range stats {
+		sorted = append(sorted, kv{k, v})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Count == sorted[j].Count {
+			// 次数相同，按 Key 升序排列（小的在前）
+			return sorted[i].Key < sorted[j].Key
+		}
+		return sorted[i].Count > sorted[j].Count // 降序：次数多的在前面
+	})
+
+	table.Clear()
+
+	// --- 表头 ---
+	headerColor := rgb(255, 255, 0) // 黄色
+	table.SetCell(0, 0, tview.NewTableCell("Key").SetTextColor(headerColor).SetSelectable(false))
+	table.SetCell(0, 1, tview.NewTableCell("Count").SetTextColor(headerColor).SetSelectable(false))
+	table.SetCell(0, 2, tview.NewTableCell("Frequency").SetTextColor(headerColor).SetSelectable(false))
+
+	// --- 数据行 ---
+	cyan := rgb(138, 226, 52)
+	barLen := 20 // 进度条总格数
+
+	for i, item := range sorted {
+		row := i + 1
+
+		// 键名（如 "Key 0x41"）
+		table.SetCell(row, 0, tview.NewTableCell(fmt.Sprintf("Key 0x%02X", item.Key)))
+
+		// 次数
+		table.SetCell(row, 1, tview.NewTableCell(fmt.Sprintf("%d", item.Count)))
+
+		// 进度条：用 █ 填充 + 空格留白
+		barPercent := item.Count
+		if barPercent > 100 {
+			barPercent = 100
+		}
+		fillLen := barPercent * barLen / 100
+		bar := fmt.Sprintf("[%s%s] %d",
+			strings.Repeat("█", fillLen),
+			strings.Repeat(" ", barLen-fillLen),
+			barPercent,
+		)
+		table.SetCell(row, 2, tview.NewTableCell(bar).SetTextColor(cyan))
 	}
 }
 
-// Init 初始化终端：切到备用屏幕、隐藏光标、把终端设为 raw 模式
-// raw 模式的意思是按键不再等待回车，一按就能读到，适合实时交互
-// 返回值 oldState 保存了进入 raw 模式前的终端状态，退出时需要用它恢复
-func (v *Visualizer) Init() (*term.State, error) {
-	fmt.Print(AltScreenOn + HideCursor)
-	return term.MakeRaw(int(os.Stdin.Fd()))
-}
-
-// Cleanup 程序退出时调用，把终端恢复成原样
-func (v *Visualizer) Cleanup(oldState *term.State) {
-	term.Restore(int(os.Stdin.Fd()), oldState)
-	fmt.Print(AltScreenOff + ShowCursor)
-}
-
-// Render 是核心函数 —— 每帧调用一次，把 stats 数据画成完整的界面
-// 它不亲自画任何东西，而是：创建组件 → 设置数据 → 让组件自己渲染
-func (v *Visualizer) Render(stats map[uint16]int) {
-	// 每次渲染前重新获取终端尺寸，窗口缩放时能自适应
-	v.width, v.height, _ = term.GetSize(int(os.Stdout.Fd()))
-
-	var b strings.Builder
-
-	// 先清屏、光标归位，确保接下来画的内容覆盖整屏
-	b.WriteString(ClearScreen + CursorHome)
-
-	// 1. 画外围边框 —— 类似 btop 的外框，标题显示在左上角
-	v.box = NewBoxComponent(2, 2, v.width-2, v.height-2, " Key Counter Pro (btop-style) ", v.pink)
-	v.box.Render(&b)
-
-	// 2. 画按键排行榜 —— 在边框内部留出边距
-	v.statsList = NewStatsListComponent(4, 4, v.width-6, v.height-6, v.cyan)
-	v.statsList.Stats = stats // 把数据塞进组件
-	v.statsList.Render(&b)
-
-	// 3. 底部提示文字
-	v.footer = NewTextComponent(4, v.height-1, "Press 'q' or Ctrl+C to quit | Monitoring Global Input...", fgRGB(150, 150, 150))
-	v.footer.Render(&b)
-
-	// 一次性输出全部内容
-	fmt.Print(b.String())
-}
-
-// fgRGB 生成设置前景色为指定 RGB 值的 ANSI 控制码
-// 这是 24-bit 真彩色，现代终端都支持
-func fgRGB(r, g, b int) string {
-	return fmt.Sprintf("%s[38;2;%d;%d;%dm", Escape, r, g, b)
+// rgb 是本包内唯一的 tcell 颜色入口，其余代码只调用 rgb() 而不直接接触 tcell
+func rgb(r, g, b int) tcell.Color {
+	return tcell.NewRGBColor(int32(r), int32(g), int32(b))
 }

@@ -3,61 +3,59 @@ package main
 import (
 	"keybord_btop/internal/display"
 	"keybord_btop/internal/keyboard"
-	"os"
 	"time"
+
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
 
-// func main() {
-// 	keyboard.KeyboardStart()
-// }
-
 func main() {
-	// 1. 初始化 UI 可视化器
-	viz := display.NewVisualizer()
-	oldState, err := viz.Init()
+	// 1. 创建 tview 应用
+	app := tview.NewApplication()
+
+	// 2. 构建界面布局（表格 + 底部状态栏）
+	root, statsTable := display.BuildDashboard()
+
+	// 3. 启动 Windows 全局键盘监听
+	eventChan, err := keyboard.StartWindowsInputListener()
 	if err != nil {
 		panic(err)
 	}
-	// 确保退出时恢复终端
-	defer viz.Cleanup(oldState)
 
-	// 2. 启动 Windows 底层全局监听 (从我们之前的封装拿)
-	eventChan, _ := keyboard.StartWindowsInputListener()
-
-	// 3. 统计数据存储
+	// 4. 按键统计数据（主 goroutine 写，ticker goroutine 读，无竞态）
 	stats := make(map[uint16]int)
 
-	// 4. 监听本地键盘输入 (用于按 'q' 退出)
-	localKeyChan := make(chan byte)
+	// 5. 后台 goroutine：消费键盘事件，更新 stats
 	go func() {
-		buf := make([]byte, 1)
-		for {
-			os.Stdin.Read(buf)
-			localKeyChan <- buf[0]
-		}
-	}()
-
-	// 5. 渲染计时器 (60 FPS)
-	ticker := time.NewTicker(16 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case ev := <-eventChan:
-			// 收到全局按键事件
+		for ev := range eventChan {
 			if ev.IsDown {
 				stats[ev.VKCode]++
 			}
-
-		case k := <-localKeyChan:
-			// 收到本地终端按键 (q 退出)
-			if k == 3 { //k == 'q'
-				return
-			}
-
-		case <-ticker.C:
-			// 执行 UI 刷新渲染
-			viz.Render(stats)
 		}
+	}()
+
+	// 6. 后台 goroutine：60fps 定时刷新 UI
+	go func() {
+		ticker := time.NewTicker(16 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			app.QueueUpdateDraw(func() {
+				display.RefreshTable(statsTable, stats)
+			})
+		}
+	}()
+
+	// 7. 全局按键处理（q / Ctrl+C 退出）
+	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Rune() == 'q' || event.Key() == tcell.KeyCtrlC || event.Key() == tcell.KeyEscape {
+			app.Stop()
+			return nil
+		}
+		return event
+	})
+
+	// 8. 启动事件循环（阻塞直到 app.Stop()）
+	if err := app.SetRoot(root, true).EnableMouse(true).Run(); err != nil {
+		panic(err)
 	}
 }
