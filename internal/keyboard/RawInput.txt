@@ -1,0 +1,276 @@
+package keyboard
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"runtime"
+	"syscall"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+)
+
+// ╔═══════════════════════════════════════════════════════════╗
+// ║         Win32 常量 —— 和 Windows 底层 API 对话的暗号      ║
+// ╚═══════════════════════════════════════════════════════════╝
+const (
+	WM_INPUT                   = 0x00FF     // Windows 消息类型：有原始输入数据来了
+	RID_INPUT                  = 0x10000003 // 告诉 GetRawInputData：我要读原始输入数据
+	RIM_TYPEKEYBOARD           = 1          // 原始输入设备类型：键盘（不是鼠标）
+	RIDEV_INPUTSINK            = 0x00000100 // 重要！让窗口即使不在前台也能收到键盘消息（后台监听全靠它）
+	HID_USAGE_PAGE_GENERIC     = 0x01       // HID 设备分类：通用设备
+	HID_USAGE_GENERIC_KEYBOARD = 0x06       // HID 设备子类型：键盘
+	RI_KEY_BREAK               = 0x0001     // 键盘标志位：键被松开了（抬起事件）
+)
+
+// ╔═══════════════════════════════════════════════════════════╗
+// ║    Win32 结构体 —— 和 Windows API 交换数据的"格式表"     ║
+// ╚═══════════════════════════════════════════════════════════╝
+// WNDCLASSEX 窗口类的"个人信息表"，告诉 Windows 我们要创建什么样的窗口
+// 可以理解为窗口的模板/蓝图，创建窗口前必须先填好这张表
+type WNDCLASSEX struct {
+	CbSize        uint32         // 这个结构体本身有多大（字节数）
+	Style         uint32         // 窗口类的风格（比如要不要处理双击）
+	LpfnWndProc   uintptr        // 消息处理函数的指针（窗口收到消息时调用哪个函数）
+	CbClsExtra    int32          // 额外预留空间（一般用不到，填0）
+	CbWndExtra    int32          // 窗口实例额外空间（一般用不到，填0）
+	HInstance     windows.Handle // 当前程序的实例句柄（相当于程序的"身份证"）
+	HIcon         windows.Handle // 窗口图标
+	HCursor       windows.Handle // 鼠标指针样式
+	HbrBackground windows.Handle // 窗口背景色
+	LpszMenuName  *uint16        // 菜单名称（我们不需要菜单）
+	LpszClassName *uint16        // 窗口类名（给这个模板起个名字，方便后面引用）
+	HIconSm       windows.Handle // 小图标（任务栏显示用）
+}
+
+// RAWINPUTDEVICE 告诉 Windows："我想监听哪种输入设备"
+// 类似填写一张订阅表，告诉系统你要订阅键盘事件
+type RAWINPUTDEVICE struct {
+	UsUsagePage uint16         // 设备大类（HID_USAGE_PAGE_GENERIC = 通用设备）
+	UsUsage     uint16         // 具体设备类型（HID_USAGE_GENERIC_KEYBOARD = 键盘）
+	DwFlags     uint32         // 监听选项（RIDEV_INPUTSINK = 后台也能收到）
+	HwndTarget  windows.Handle // 消息发给哪个窗口（我们的隐形窗口）
+}
+
+// RAWINPUTHEADER 原始输入数据的"文件头"，告诉你：
+// 这次输入是什么类型（键盘/鼠标）、数据有多大、来自哪个设备
+type RAWINPUTHEADER struct {
+	DwType  uint32         // 输入类型（1=键盘，2=鼠标）
+	DwSize  uint32         // 整包数据的大小（多少字节）
+	HDevice windows.Handle // 产生这次输入的设备句柄
+	WParam  uintptr        // 备用参数（Windows 内部用）
+}
+
+// RAWKEYBOARD 键盘按键的详细信息，告诉你：
+// 哪个键被按了、是按下还是松开、属于什么按键码
+type RAWKEYBOARD struct {
+	MakeCode         uint16 // 硬件扫描码（键盘物理位置对应的码）
+	Flags            uint16 // 状态标志（RI_KEY_BREAK=松开，0=按下）
+	Reserved         uint16 // 保留不用
+	VKey             uint16 // 虚拟键码（Windows 定义的按键码，比如 ESC=0x1B）
+	Message          uint32 // 对应的 Windows 消息编号
+	ExtraInformation uint32 // 额外信息（几乎用不到）
+}
+
+// MSG Windows 消息结构体，消息泵中每一条消息都长这样
+// 我们的消息循环就是不断从这个结构体里读取消息
+type MSG struct {
+	Hwnd    windows.Handle       // 消息目标窗口
+	Message uint32               // 消息类型编号
+	WParam  uintptr              // 消息附加参数1
+	LParam  uintptr              // 消息附加参数2
+	Time    uint32               // 消息产生时间
+	Pt      struct{ X, Y int32 } // 消息产生时的鼠标位置
+}
+
+// ╔═══════════════════════════════════════════════════════════╗
+// ║    DLL 加载 —— 把 Windows 系统函数"借"到 Go 中来用       ║
+// ║    user32.dll 是 Windows 图形界面的核心仓库              ║
+// ╚═══════════════════════════════════════════════════════════╝
+var (
+	user32                  = windows.NewLazySystemDLL("user32.dll")    // 加载 user32.dll
+	procRegisterClassExW    = user32.NewProc("RegisterClassExW")        // 注册窗口类
+	procCreateWindowExW     = user32.NewProc("CreateWindowExW")         // 创建窗口
+	procDefWindowProcW      = user32.NewProc("DefWindowProcW")          // 默认消息处理（我们不处理的消息丢给它）
+	procRegisterRawInputDev = user32.NewProc("RegisterRawInputDevices") // 注册原始输入设备（订阅键盘事件）
+	procGetRawInputData     = user32.NewProc("GetRawInputData")         // 获取原始输入数据（读取按键信息）
+	procGetMessageW         = user32.NewProc("GetMessageW")             // 从消息队列取一条消息
+	procDispatchMessageW    = user32.NewProc("DispatchMessageW")        // 把消息分发到对应的窗口处理函数
+	procTranslateMessage    = user32.NewProc("TranslateMessage")        // 翻译键盘消息（将虚拟键码转换为字符）
+)
+
+// keyCounts 按键计数器，记录每个虚拟键码被按了多少次
+// key[虚拟键码] = 按下次数（只统计按下，不统计松开）
+var keyCounts = make(map[uint16]int)
+
+// WndProc 窗口消息处理函数 —— 这是整个程序的"心脏"
+// Windows 每收到一个事件（按键、鼠标、窗口操作等）都会调用这个函数
+// 我们在这里筛选出键盘事件，统计按键次数
+//
+// 参数通俗解释：
+//
+//	hwnd    —— 哪个窗口收到了消息
+//	msg     —— 消息类型编号（WM_INPUT=0x00FF 表示有原始输入数据）
+//	wParam  —— 附加信息1
+//	lParam  —— 附加信息2（对于 WM_INPUT，它指向原始输入数据的句柄）
+func WndProc(hwnd windows.Handle, msg uint32, wParam uintptr, lParam uintptr) uintptr {
+	// 只处理"有原始输入数据来了"这种消息
+	if msg == WM_INPUT {
+		var dwSize uint32
+
+		// 第1步：先问 Windows "这次数据有多大？"（空手问路，只拿大小）
+		headerSize := uint32(unsafe.Sizeof(RAWINPUTHEADER{}))
+		procGetRawInputData.Call(lParam, RID_INPUT, 0, uintptr(unsafe.Pointer(&dwSize)), uintptr(headerSize))
+
+		if dwSize > 0 {
+			// 第2步：知道大小后，分配一块内存，再真正读取数据（拿着篮子去取数据）
+			buffer := make([]byte, dwSize)
+			procGetRawInputData.Call(lParam, RID_INPUT, uintptr(unsafe.Pointer(&buffer[0])), uintptr(unsafe.Pointer(&dwSize)), uintptr(headerSize))
+
+			// 第3步：把原始字节数据转换成 Go 能看懂的结构体
+			// 先读"数据头"，看看是什么设备发来的
+			header := (*RAWINPUTHEADER)(unsafe.Pointer(&buffer[0]))
+
+			// 确认是键盘事件（不是鼠标）
+			if header.DwType == RIM_TYPEKEYBOARD {
+				// 跳过"数据头"，读取后面的"键盘按键详情"
+				keyboardData := (*RAWKEYBOARD)(unsafe.Pointer(&buffer[unsafe.Sizeof(RAWINPUTHEADER{})]))
+
+				// Flags 为 0 = 按键按下
+				// Flags 带 RI_KEY_BREAK 标志 = 按键松开
+				// 我们只统计"按下"，忽略"松开"
+				if keyboardData.Flags&RI_KEY_BREAK == 0 {
+					keyCounts[keyboardData.VKey]++
+					fmt.Printf("检测到按键按下: VK_CODE [0x%02X], 累计次数: %d\n", keyboardData.VKey, keyCounts[keyboardData.VKey])
+				}
+			}
+		}
+	}
+
+	// 不是 WM_INPUT 的其他消息，交给 Windows 默认处理（我们不关心的消息统统丢给系统）
+	ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(msg), wParam, lParam)
+	return ret
+}
+
+// main 程序入口
+// 流程：启动后台监听 → 等待就绪 → 阻塞直到用户按 Ctrl+C → 退出
+func KeyboardStart() {
+	fmt.Println("启动 Raw Input 安全键盘监听模式...")
+
+	// readyChan 是一个"就绪信号灯"：后台线程准备好后，会关闭这个通道通知主线程
+	readyChan := make(chan struct{})
+
+	// 开一个独立的后台 goroutine 去创建隐形窗口、启动消息循环
+	// 为什么必须用 goroutine？因为消息循环是个死循环，会一直阻塞在那里取消息
+	go startRawInputLoop(readyChan)
+
+	// 堵塞等待，直到后台线程说"我准备好了"
+	<-readyChan
+	fmt.Println("隐形窗口注册成功！请在任意界面按下键盘进行测试。按 Ctrl+C 退出。")
+
+	// 注册信号监听：当用户按 Ctrl+C 或系统要求终止时，sigChan 会收到信号
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan // 主线程卡在这里，等待退出信号
+
+	fmt.Println("\n程序优雅退出。")
+}
+
+// startRawInputLoop 后台监听主干逻辑
+// 这一步必须在操作系统线程中运行（runtime.LockOSThread），因为：
+// Windows 的消息循环是绑定线程的，线程换了消息循环就废了
+//
+// 整体流程分4步：
+//  1. 注册窗口类（告诉 Windows 你要哪种窗口）
+//  2. 创建隐形窗口（只收消息，不显示在屏幕上）
+//  3. 订阅键盘事件（告诉 Windows "键盘事件发给我"）
+//  4. 进入死循环取消息（不停地接收、分发消息）
+func startRawInputLoop(ready chan struct{}) {
+	// 把当前 goroutine 锁定到物理线程上，防止 Go 运行时把它调度到别的线程
+	// 这是 Windows GUI 编程的硬性要求：消息循环不能换线程
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// 获取当前程序的实例句柄（hInstance）
+	// 可以把 hInstance 理解为程序的"身份证号"，Windows 靠它识别是谁在调用 API
+	kernel32 := windows.NewLazySystemDLL("kernel32.dll")
+	procGetModuleHandle := kernel32.NewProc("GetModuleHandleW")
+	hInst, _, _ := procGetModuleHandle.Call(0)
+	hInstance := windows.Handle(hInst)
+
+	// 窗口类名：给我们的窗口模板起个唯一名字，避免和别人冲突
+	className, _ := windows.UTF16PtrFromString("RawInputHiddenClass")
+
+	// ═══ 第1步：注册窗口类 ═══
+	// 相当于告诉 Windows："我要一种特殊的窗口，长这样，消息处理函数是这个"
+	wcex := WNDCLASSEX{
+		CbSize:        uint32(unsafe.Sizeof(WNDCLASSEX{})),
+		LpfnWndProc:   windows.NewCallback(WndProc), // 指定消息处理函数
+		HInstance:     hInstance,                    // 当前程序的身份标识
+		LpszClassName: className,                    // 窗口类名称
+	}
+	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wcex)))
+
+	// HWND_MESSAGE：这个值等于 -3（^2 是按位取反的写法，在32位和64位下都安全）
+	// 传入 CreateWindowExW 后，Windows 会创建"只收消息、不显示"的隐形窗口
+	// 普通窗口需要句柄 HWND_DESKTOP(0) 才会显示在桌面，而 HWND_MESSAGE(-3) 是纯后台窗口
+	const HWND_MESSAGE = ^uintptr(2)
+
+	// ═══ 第2步：创建隐形窗口 ═══
+	// 这个窗口看不见摸不着，唯一的任务就是接收键盘消息
+	hwnd, _, err := procCreateWindowExW.Call(
+		0,                                  // 扩展风格（不需要）
+		uintptr(unsafe.Pointer(className)), // 用刚才注册的窗口类
+		0,                                  // 窗口标题（不需要）
+		0,                                  // 窗口风格（不需要花里胡哨的）
+		0, 0, 0, 0,                         // 位置和大小（隐形窗口不需要这些）
+		HWND_MESSAGE,       // 父窗口 = 消息窗口（告诉系统：我是隐形的）
+		0,                  // 菜单（不需要）
+		uintptr(hInstance), // 程序实例句柄
+		0,                  // 附加参数（不需要）
+	)
+	if hwnd == 0 {
+		log.Fatalf("创建隐形窗口失败: %v", err)
+	}
+
+	// ═══ 第3步：注册原始输入设备 ═══
+	// 告诉 Windows："把键盘的原始输入数据，发到我刚刚创建的隐形窗口"
+	rid := RAWINPUTDEVICE{
+		UsUsagePage: HID_USAGE_PAGE_GENERIC,     // 设备大类：通用
+		UsUsage:     HID_USAGE_GENERIC_KEYBOARD, // 设备类型：键盘
+		DwFlags:     RIDEV_INPUTSINK,            // 关键标志：即使本程序不在前台也能收到消息
+		HwndTarget:  windows.Handle(hwnd),       // 数据发给这个窗口
+	}
+
+	ret, _, err := procRegisterRawInputDev.Call(
+		uintptr(unsafe.Pointer(&rid)),
+		1,                           // 只注册1个设备
+		uintptr(unsafe.Sizeof(rid)), // 设备结构体大小
+	)
+	if ret == 0 {
+		log.Fatalf("注册 Raw Input 失败: %v", err)
+	}
+
+	// 一切就绪，通知主 goroutine："可以开始工作了！"
+	close(ready)
+
+	// ═══ 第4步：消息循环（死循环） ═══
+	// 这是 Windows 程序的"心脏"，不停从消息队列取消息然后分发处理
+	// GetMessageW 会阻塞等待，有消息来了才返回，不会空转浪费 CPU
+	var msg MSG
+	for {
+		// 从消息队列取一条消息（没消息就睡觉，不占 CPU）
+		ret, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
+		// ret == 0 表示收到了 WM_QUIT（退出消息）
+		// ret == -1 表示出错了
+		if ret == 0 || ret == ^uintptr(0) {
+			break
+		}
+		// 翻译键盘消息（把虚拟键码转成字符，虽然我们不需要，但是标准流程）
+		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
+		// 分发消息到窗口处理函数（WndProc）
+		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
+	}
+}
