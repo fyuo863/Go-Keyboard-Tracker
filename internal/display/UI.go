@@ -6,10 +6,17 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
+
+// KeyEntry 带时间戳的按键记录，用于 Input Queue 的时基渐隐显示。
+type KeyEntry struct {
+	Name string
+	At   time.Time
+}
 
 // tabHitArea 记录标签页标题在屏幕上的起止位置，
 // 用于判断鼠标点击落在了哪个标签上。
@@ -61,15 +68,15 @@ func BuildDashboard() *DashboardUI {
 	graph := NewBrailleGraphView()
 	queueView := tview.NewTextView()
 	queueView.SetDynamicColors(true)
-	queueView.SetWrap(false)
+	queueView.SetWrap(true)
 	queueView.SetBorder(true)
 	queueView.SetTitle(" Input Queue ")
 	queueView.SetBorderColor(rgb(114, 159, 207))
 	queueView.SetTitleColor(rgb(114, 159, 207))
 
 	tab1 := tview.NewFlex().SetDirection(tview.FlexRow)
-	tab1.AddItem(graph, 0, 4, true)      // 曲线图占 4 份高度，可伸缩
-	tab1.AddItem(queueView, 8, 0, false) // 队列固定 8 行
+	tab1.AddItem(graph, 0, 5, true)      // 曲线图占 5 份高度
+	tab1.AddItem(queueView, 3, 0, false) // 队列固定 3 行
 
 	// —— Tab2：按键次数统计表 ——
 	statsTable := tview.NewTable()
@@ -92,13 +99,23 @@ func BuildDashboard() *DashboardUI {
 
 	// —— 组装根布局 ——
 	root := tview.NewFlex().SetDirection(tview.FlexRow)
-	root.AddItem(title, 1, 0, false)  // 标题固定 3 行
+	root.AddItem(title, 1, 0, false)  // 标题固定 1 行
 	root.AddItem(tabBar, 3, 0, false) // 标签栏固定 3 行
 	root.AddItem(pages, 0, 1, true)   // 页面区占满剩余空间
 	root.AddItem(footer, 1, 0, false) // 页脚固定 1 行
 
+	// 外层隐形容器：上下左右各 2 格页边距
+	outerWrapper := tview.NewFlex().SetDirection(tview.FlexRow)
+	outerWrapper.AddItem(nil, 0, 0, false) // 上边距
+	contentRow := tview.NewFlex().SetDirection(tview.FlexColumn)
+	contentRow.AddItem(nil, 2, 0, false) // 左边距
+	contentRow.AddItem(root, 0, 1, true) // 内容区
+	contentRow.AddItem(nil, 2, 0, false) // 右边距
+	outerWrapper.AddItem(contentRow, 0, 1, true)
+	outerWrapper.AddItem(nil, 2, 0, false) // 下边距
+
 	ui := &DashboardUI{
-		Root:           root,
+		Root:           outerWrapper,
 		Pages:          pages,
 		TabBar:         tabBar,
 		StatsTable:     statsTable,
@@ -206,19 +223,35 @@ func (ui *DashboardUI) installTabMouseHandler() {
 	})
 }
 
-// RefreshInputQueue 刷新按键队列视图，显示最近的按键记录。
-// recent 按时间升序排列（最早在前），显示时倒序输出（最新在上）。
-func RefreshInputQueue(view *tview.TextView, recent []string) {
+// RefreshInputQueue 刷新按键队列视图。
+// 从左到右排列，最新按键在最左侧，每个按键根据其按下后的经过时间逐渐变暗。
+// 亮青色(0,255,255) 经过 3 秒线性衰减到暗灰色(0,51,51) 后亮度不再降低。
+// recent 按时间升序排列（最早在前 index=0，最新在末尾）。
+func RefreshInputQueue(view *tview.TextView, recent []KeyEntry) {
 	if len(recent) == 0 {
 		view.SetText("[gray]Waiting for keyboard input...")
 		return
 	}
 	var builder strings.Builder
-	// 倒序遍历，让最新的按键显示在最上面
-	for i := len(recent) - 1; i >= 0; i-- {
-		builder.WriteString(recent[i])
+	now := time.Now()
+	maxAge := 3.0 // 秒，到达此时间后亮度不再降低
+	n := len(recent)
+	// 倒序遍历：最新（最右侧元素）先输出，排在最左边
+	for i := n - 1; i >= 0; i-- {
+		elapsed := now.Sub(recent[i].At).Seconds()
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		// t: 0=刚按下(最亮), 1=maxAge后(最暗)
+		t := elapsed / maxAge
+		if t > 1.0 {
+			t = 1.0
+		}
+		// 亮度 100% → 20%，即 R:0, G和B: 255 → 51
+		v := int(255 - t*204)
+		fmt.Fprintf(&builder, "[#00%02x%02x]%s[-:-:-]", v, v, recent[i].Name)
 		if i > 0 {
-			builder.WriteByte('\n')
+			builder.WriteString(" ")
 		}
 	}
 	view.SetText(builder.String())
@@ -330,10 +363,11 @@ func (g *BrailleGraphView) Draw(screen tcell.Screen) {
 		return
 	}
 
-	// 只显示最近 visible 个采样点（每个字符列可容纳 2 个采样点）
-	visible := width * 2
-	if visible < len(samples) {
-		samples = samples[len(samples)-visible:]
+	// 每个字符列可容纳 2 个采样点（盲文字符左右两列），
+	// 整个 box 宽度可容纳 width*2 个采样点
+	maxCols := width * 2
+	if maxCols < len(samples) {
+		samples = samples[len(samples)-maxCols:]
 	}
 	maxValue := 0
 	for _, v := range samples {
@@ -347,21 +381,21 @@ func (g *BrailleGraphView) Draw(screen tcell.Screen) {
 	}
 
 	// 构建高精度网格：高度 = 字符行数 × 4，宽度 = 字符列数 × 2
-	// 每个字符列可容纳 2 个采样点（盲文字符的左右两列）
 	cells := make([][]int, height*4)
 	for i := range cells {
 		cells[i] = make([]int, width*2)
 	}
 
-	// 将采样值按比例缩放到网格高度
+	// 曲线从最右侧开始绘制：计算左侧偏移量，使数据右对齐
+	offset := maxCols - len(samples)
 	for i, sample := range samples {
-		col := i
+		col := offset + i
 		scaled := int(math.Round(float64(sample) / float64(maxValue) * float64(height*4)))
 		if scaled < 1 && sample > 0 {
-			scaled = 1 // 非零采样值至少显示 1 格高度
+			scaled = 1
 		}
 		for level := 0; level < scaled && level < height*4; level++ {
-			row := height*4 - 1 - level // 底部对齐
+			row := height*4 - 1 - level
 			cells[row][col] = 1
 		}
 	}
@@ -370,17 +404,17 @@ func (g *BrailleGraphView) Draw(screen tcell.Screen) {
 	for cellY := 0; cellY < height; cellY++ {
 		for cellX := 0; cellX < width; cellX++ {
 			pattern := braillePattern(cells, cellY, cellX)
-			ch := rune(0x2800 + pattern) // 盲文字符起点 U+2800
+			ch := rune(0x2800 + pattern)
 			if pattern == 0 {
-				ch = ' ' // 空字符显示为空格
+				ch = ' '
 			}
 			screen.SetContent(x+cellX, y+cellY, ch, nil, style)
 		}
 	}
 
-	// 在左上角标注当前最大值
-	label := fmt.Sprintf("max %d keys / 30s", maxValue)
-	tview.Print(screen, label, x, y, width, tview.AlignRight, rgb(114, 159, 207))
+	// 在 box 内部左上角标注最大值
+	label := fmt.Sprintf("max %d keys", maxValue)
+	tview.Print(screen, label, x, y, len(label), tview.AlignLeft, rgb(114, 159, 207))
 	_ = textStyle
 }
 
