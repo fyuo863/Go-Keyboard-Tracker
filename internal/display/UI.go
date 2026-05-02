@@ -68,7 +68,7 @@ func BuildDashboard() *DashboardUI {
 	graph := NewBrailleGraphView()
 	queueView := tview.NewTextView()
 	queueView.SetDynamicColors(true)
-	queueView.SetWrap(true)
+	queueView.SetWrap(false) // 单行显示，超出部分自然截断
 	queueView.SetBorder(true)
 	queueView.SetTitle(" Input Queue ")
 	queueView.SetBorderColor(rgb(114, 159, 207))
@@ -76,7 +76,7 @@ func BuildDashboard() *DashboardUI {
 
 	tab1 := tview.NewFlex().SetDirection(tview.FlexRow)
 	tab1.AddItem(graph, 0, 5, true)      // 曲线图占 5 份高度
-	tab1.AddItem(queueView, 3, 0, false) // 队列固定 3 行
+	tab1.AddItem(queueView, 3, 0, false) // 队列固定 1 行
 
 	// —— Tab2：按键次数统计表 ——
 	statsTable := tview.NewTable()
@@ -234,26 +234,24 @@ func RefreshInputQueue(view *tview.TextView, recent []KeyEntry) {
 	}
 	var builder strings.Builder
 	now := time.Now()
-	maxAge := 3.0 // 秒，到达此时间后亮度不再降低
+	maxAge := 3.0
 	n := len(recent)
-	// 倒序遍历：最新（最右侧元素）先输出，排在最左边
 	for i := n - 1; i >= 0; i-- {
 		elapsed := now.Sub(recent[i].At).Seconds()
 		if elapsed < 0 {
 			elapsed = 0
 		}
-		// t: 0=刚按下(最亮), 1=maxAge后(最暗)
 		t := elapsed / maxAge
 		if t > 1.0 {
 			t = 1.0
 		}
-		// 亮度 100% → 20%，即 R:0, G和B: 255 → 51
 		v := int(255 - t*204)
-		fmt.Fprintf(&builder, "[#00%02x%02x]%s[-:-:-]", v, v, recent[i].Name)
+		fmt.Fprintf(&builder, "[#00%02x%02x]%s", v, v, recent[i].Name)
 		if i > 0 {
 			builder.WriteString(" ")
 		}
 	}
+	builder.WriteString("[-]")
 	view.SetText(builder.String())
 }
 
