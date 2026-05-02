@@ -8,6 +8,11 @@
 - 支持 Windows 平台的原生 API
 - 直观的 UI 显示
 
+## 技术说明
+- 本项目使用 vibe coding 作为开发方式
+- UI 基于 [tview](https://github.com/rivo/tview) 库
+- 终端渲染基于 [tcell](https://github.com/gdamore/tcell) 库
+
 ## 使用方法
 
 ### 环境要求
