@@ -1,3 +1,5 @@
+[中文](README.md) | [English](README.en.md)
+
 # 键盘监测_btop风格
 
 ## 项目简介
