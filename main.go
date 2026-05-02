@@ -78,20 +78,20 @@ func main() {
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch {
-		case event.Key() == tcell.KeyCtrlC || event.Key() == tcell.KeyEscape: //event.Rune() == 'q' ||
+		case event.Key() == tcell.KeyCtrlC || event.Key() == tcell.KeyEscape:
 			app.Stop()
 			return nil
 		case event.Key() == tcell.KeyLeft:
-			app.QueueUpdateDraw(func() { ui.PrevTab() })
+			ui.PrevTab()
 			return nil
 		case event.Key() == tcell.KeyRight:
-			app.QueueUpdateDraw(func() { ui.NextTab() })
+			ui.NextTab()
 			return nil
 		case event.Rune() == '1':
-			app.QueueUpdateDraw(func() { ui.SetActiveTab(0) })
+			ui.SetActiveTab(0)
 			return nil
 		case event.Rune() == '2':
-			app.QueueUpdateDraw(func() { ui.SetActiveTab(1) })
+			ui.SetActiveTab(1)
 			return nil
 		default:
 			return event

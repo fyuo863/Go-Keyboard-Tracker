@@ -6,7 +6,6 @@ import (
 	"math"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -22,6 +21,7 @@ type tabHitArea struct {
 
 // DashboardUI 是整个键盘监测仪表盘的主界面结构体，
 // 把所有子组件（标题、标签栏、页面区、页脚）组合在一起。
+// 所有方法均在 tview 事件循环 goroutine 中运行，无需加锁。
 type DashboardUI struct {
 	Root           tview.Primitive   // 顶层布局，传递给 tview.Application
 	Pages          *tview.Pages      // 页面切换容器，容纳 tab1 / tab2
@@ -34,7 +34,6 @@ type DashboardUI struct {
 	activeTab int          // 当前激活的标签页编号
 	tabNames  []string     // 所有标签页的页面名称列表
 	hitAreas  []tabHitArea // 当前标签文字的可点击区域缓存
-	mu        sync.RWMutex // 读写锁，保护并发访问
 }
 
 // BuildDashboard 构建整个仪表盘 UI 并返回。
@@ -88,7 +87,7 @@ func BuildDashboard() *DashboardUI {
 	// —— 页脚操作提示 ——
 	footer := tview.NewTextView()
 	footer.SetDynamicColors(true)
-	footer.SetText("←/→ or 1/2 switch tabs | Click tab labels | q / Esc / Ctrl+C quit")
+	footer.SetText("←/→ or 1/2 switch tabs | Esc / Ctrl+C quit")
 	footer.SetTextColor(rgb(150, 150, 150))
 
 	// —— 组装根布局 ——
@@ -121,38 +120,32 @@ func BuildDashboard() *DashboardUI {
 
 // SetActiveTab 切换到指定序号的标签页，同时高亮对应标签文字。
 func (ui *DashboardUI) SetActiveTab(index int) {
-	ui.mu.Lock()
-	defer ui.mu.Unlock()
 	if index < 0 || index >= len(ui.tabNames) {
 		return // 序号非法，直接忽略
 	}
+	if index == ui.activeTab {
+		return // 已在目标页，无需切换
+	}
 	ui.activeTab = index
-	// SwitchToPage 原子性地完成：显示目标页 + 隐藏其余页 + 重新聚焦，
-	// 避免分步 ShowPage/HidePage 造成中间状态无可见页面导致卡死。
+	// SwitchToPage 原子性地完成：显示目标页 + 隐藏其余页 + 重新聚焦
 	ui.Pages.SwitchToPage(ui.tabNames[index])
 	ui.renderTabsLocked() // 重绘标签栏高亮
 }
 
 // NextTab 切换到下一个标签页（循环）。
 func (ui *DashboardUI) NextTab() {
-	ui.mu.RLock()
 	next := (ui.activeTab + 1) % len(ui.tabNames)
-	ui.mu.RUnlock()
 	ui.SetActiveTab(next)
 }
 
 // PrevTab 切换到上一个标签页（循环）。
 func (ui *DashboardUI) PrevTab() {
-	ui.mu.RLock()
 	prev := (ui.activeTab - 1 + len(ui.tabNames)) % len(ui.tabNames)
-	ui.mu.RUnlock()
 	ui.SetActiveTab(prev)
 }
 
-// renderTabs 加锁后调用内部渲染方法，绘制标签栏。
+// renderTabs 绘制标签栏文字与点击区域缓存。
 func (ui *DashboardUI) renderTabs() {
-	ui.mu.Lock()
-	defer ui.mu.Unlock()
 	ui.renderTabsLocked()
 }
 
@@ -202,11 +195,8 @@ func (ui *DashboardUI) installTabMouseHandler() {
 		}
 		column := x - rectX
 
-		// 复制点击区域快照，避免加锁时间过长
-		ui.mu.RLock()
-		hitAreas := append([]tabHitArea(nil), ui.hitAreas...)
-		ui.mu.RUnlock()
-		for _, area := range hitAreas {
+		// 遍历点击区域判断落在哪个标签上
+		for _, area := range ui.hitAreas {
 			if column >= area.Start && column < area.End {
 				ui.SetActiveTab(area.Index)
 				return action, nil // 消费该事件
@@ -300,10 +290,10 @@ func RefreshTable(table *tview.Table, stats map[uint16]int) {
 // BrailleGraphView 是一个自定义的 tview 组件，
 // 用 Unicode 盲文字符 (U+2800~U+28FF) 在终端中绘制按键频率曲线图。
 // 每个盲文字符包含 2×4 个点，相比普通柱状图精度更高。
+// SetSamples 和 Draw 均在事件循环同一 goroutine 中调用，无需加锁。
 type BrailleGraphView struct {
 	*tview.Box
-	mu      sync.RWMutex // 保护 samples 的并发读写
-	samples []int        // 各时间桶的按键次数数据
+	samples []int // 各时间桶的按键次数数据
 }
 
 // NewBrailleGraphView 创建盲文曲线图组件并设置边框样式。
@@ -316,10 +306,8 @@ func NewBrailleGraphView() *BrailleGraphView {
 	return &BrailleGraphView{Box: box}
 }
 
-// SetSamples 线程安全地更新曲线图采样数据。
+// SetSamples 更新曲线图采样数据。
 func (g *BrailleGraphView) SetSamples(samples []int) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.samples = append([]int(nil), samples...)
 }
 
@@ -332,10 +320,8 @@ func (g *BrailleGraphView) Draw(screen tcell.Screen) {
 		return
 	}
 
-	// 获取采样数据的副本，避免绘制过程中数据被修改
-	g.mu.RLock()
+	// 获取采样数据的副本
 	samples := append([]int(nil), g.samples...)
-	g.mu.RUnlock()
 
 	style := tcell.StyleDefault.Foreground(rgb(138, 226, 52))
 	textStyle := tcell.StyleDefault.Foreground(rgb(150, 150, 150))
