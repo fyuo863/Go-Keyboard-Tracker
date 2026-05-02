@@ -19,26 +19,7 @@
 - Golang 1.20 或更高版本
 - Windows 操作系统
 
-### 安装步骤
-1. 克隆项目到本地：
-   ```bash
-   git clone https://github.com/yourusername/键盘监测_btop风格.git
-   ```
-2. 进入项目目录：
-   ```bash
-   cd 键盘监测_btop风格
-   ```
-3. 构建项目：
-   ```bash
-   go build .
-   ```
-4. 运行程序：
-   ```bash
-   ./键盘监测_btop风格.exe
-   ```
 
-## 示例
-运行程序后，您将看到一个实时更新的键盘输入监测界面，类似于 btop 的风格。
 
 ## 文件结构
 ```
