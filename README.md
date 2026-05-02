@@ -13,6 +13,11 @@
 - UI 基于 [tview](https://github.com/rivo/tview) 库
 - 终端渲染基于 [tcell](https://github.com/gdamore/tcell) 库
 
+## 界面预览
+![主页展示](Img/main_p.png)
+
+![运行时界面](Img/main_f.png)
+
 ## 使用方法
 
 ### 环境要求
