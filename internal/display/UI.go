@@ -106,7 +106,7 @@ func BuildDashboard() *DashboardUI {
 
 	// 外层隐形容器：上下左右各 2 格页边距
 	outerWrapper := tview.NewFlex().SetDirection(tview.FlexRow)
-	outerWrapper.AddItem(nil, 0, 0, false) // 上边距
+	outerWrapper.AddItem(nil, 1, 0, false) // 上边距（预留第0行给FPS）
 	contentRow := tview.NewFlex().SetDirection(tview.FlexColumn)
 	contentRow.AddItem(nil, 2, 0, false) // 左边距
 	contentRow.AddItem(root, 0, 1, true) // 内容区

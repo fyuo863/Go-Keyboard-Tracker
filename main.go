@@ -82,10 +82,9 @@ func main() {
 
 	// FPS 平滑值，指数移动平均
 	var (
-		fpsSmooth  float64
-		fpsLast    = time.Now()
-		fpsAlpha   = 0.05 // 平滑系数，越小越平滑
-		fpsCounter int
+		fpsSmooth float64
+		fpsLast   = time.Now()
+		fpsAlpha  = 0.05 // 平滑系数，越小越平滑
 	)
 	app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
 		now := time.Now()
@@ -99,14 +98,10 @@ func main() {
 				fpsSmooth = fpsAlpha*instant + (1-fpsAlpha)*fpsSmooth
 			}
 		}
-		fpsCounter++
-		// 每 4 帧更新一次显示，减少绘制开销
-		if fpsCounter%4 == 0 {
-			fpsText := fmt.Sprintf(" %.0f fps ", fpsSmooth)
-			style := tcell.StyleDefault.Foreground(tcell.NewRGBColor(150, 150, 150))
-			for i, ch := range fpsText {
-				screen.SetContent(i, 0, ch, nil, style)
-			}
+		fpsText := fmt.Sprintf(" %.0f fps ", fpsSmooth)
+		style := tcell.StyleDefault.Foreground(tcell.NewRGBColor(150, 150, 150))
+		for i, ch := range fpsText {
+			screen.SetContent(i, 0, ch, nil, style)
 		}
 		return false // false = 正常绘制
 	})
