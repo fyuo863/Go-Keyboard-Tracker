@@ -78,7 +78,7 @@ func main() {
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch {
-		case event.Rune() == 'q' || event.Key() == tcell.KeyCtrlC || event.Key() == tcell.KeyEscape:
+		case event.Key() == tcell.KeyCtrlC || event.Key() == tcell.KeyEscape: //event.Rune() == 'q' ||
 			app.Stop()
 			return nil
 		case event.Key() == tcell.KeyLeft:
